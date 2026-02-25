@@ -1,0 +1,218 @@
+#cloud-config
+packages:
+  - git
+  - jq
+  - vim
+  - language-pack-en
+  - wget
+  - curl
+  - zip
+  - unzip
+  - podman
+
+write_files:
+  - path: "/etc/terraform-enterprise/certs/cert.pem"
+    permissions: "0644"
+    owner: "root:root"
+    content: |
+      ${server_cert}
+
+  - path: "/etc/terraform-enterprise/certs/key.pem"
+    permissions: "0644"
+    owner: "root:root"
+    content: |
+      ${private_key}
+
+  - path: "/etc/terraform-enterprise/certs/bundle.pem"
+    permissions: "0644"
+    owner: "root:root"
+    content: |
+      ${bundle_certs}
+
+  - path: "/etc/terraform-enterprise/config.yaml"
+    permissions: "0644"
+    owner: "root:root"
+    content: |
+      ---
+      apiVersion: "v1"
+      kind: "Pod"
+      metadata:
+        labels:
+          app: "terraform-enterprise"
+        name: "terraform-enterprise"
+      spec:
+        restartPolicy: "Never"
+        containers:
+        - env:
+          - name: "TFE_OPERATIONAL_MODE"
+            value: "disk"
+          - name: "TFE_LICENSE"
+            value: "${tfe_license}"
+          - name: "TFE_HOSTNAME"
+            value: "${tfe_hostname}"
+          - name: "TFE_HTTP_PORT"
+            value: "8080"
+          - name: "TFE_HTTPS_PORT"
+            value: "8443"
+          - name: "TFE_TLS_CERT_FILE"
+            value: "/etc/ssl/private/terraform-enterprise/cert.pem"
+          - name: "TFE_TLS_KEY_FILE"
+            value: "/etc/ssl/private/terraform-enterprise/key.pem"
+          - name: "TFE_TLS_CA_BUNDLE_FILE"
+            value: "/etc/ssl/private/terraform-enterprise/bundle.pem"
+          - name: "TFE_DISK_CACHE_VOLUME_NAME"
+            value: "terraform-enterprise_terraform-enterprise-cache"
+          - name: "TFE_ENCRYPTION_PASSWORD"
+            value: "${tfe_encryption_password}"
+          image: "images.releases.hashicorp.com/hashicorp/terraform-enterprise:${tfe_image_tag}"
+          name: "terraform-enterprise"
+          ports:
+          - containerPort: 8080
+            hostPort: 80
+          - containerPort: 8443
+            hostPort: 443
+          - containerPort: 9090
+            hostPort: 9090
+          securityContext:
+            capabilities:
+              add:
+              - "CAP_IPC_LOCK"
+            readOnlyRootFilesystem: true
+            seLinuxOptions:
+              type: "spc_t"
+          volumeMounts:
+          - mountPath: "/etc/ssl/private/terraform-enterprise"
+            name: "certs"
+          - mountPath: "/var/log/terraform-enterprise"
+            name: "log"
+          - mountPath: "/run"
+            name: "run"
+          - mountPath: "/tmp"
+            name: "tmp"
+          - mountPath: "/var/lib/terraform-enterprise"
+            name: "data"
+          - mountPath: "/run/docker.sock"
+            name: "docker-sock"
+          - mountPath: "/var/cache/tfe-task-worker/terraform"
+            name: "terraform-enterprise_terraform-enterprise-cache-pvc"
+        volumes:
+        - hostPath:
+            path: "${certs_dir}"
+            type: "Directory"
+          name: "certs"
+        - emptyDir:
+            medium: "Memory"
+          name: "log"
+        - emptyDir:
+            medium: "Memory"
+          name: "run"
+        - emptyDir:
+            medium: "Memory"
+          name: "tmp"
+        - hostPath:
+            path: "${data_dir}"
+            type: "Directory"
+          name: "data"
+        - hostPath:
+            path: "/run/podman/podman.sock"
+            type: "File"
+          name: "docker-sock"
+        - name: "terraform-enterprise_terraform-enterprise-cache-pvc"
+          persistentVolumeClaim:
+            claimName: "terraform-enterprise_terraform-enterprise-cache"
+
+  - path: "/etc/terraform-enterprise/registry-token"
+    permissions: "0600"
+    owner: "root:root"
+    content: |
+      ${tfe_license}
+
+  - path: "/tmp/payload.json"
+    permissions: "0755"
+    owner: "root:root"
+    content: |
+      {
+        "username": "admin",
+        "email": "${email}",
+        "password": "${tfe_encryption_password}"
+      }
+
+  - path: "/etc/containers/systemd/terraform-enterprise.kube"
+    permissions: "0644"
+    owner: "root:root"
+    content: |
+      [Install]
+      WantedBy=default.target
+      [Service]
+      Restart=always
+      [Kube]
+      Yaml=tfe.yaml
+
+  - path: "/usr/local/bin/tfe-admin-user.sh"
+    permissions: "0755"
+    owner: "root:root"
+    content: |
+      #!/usr/bin/env bash
+       
+      pushd /etc/terraform-enterprise
+      
+      # wait until tfe is up and running
+      while ! curl -ksfS --connect-timeout 5 https://${tfe_hostname}/_health_check; do
+        sleep 5
+      done
+      
+      FILE=iact.token
+      if [ ! -e "$FILE" ] || [ ! -s "$FILE" ]; then
+        echo info: generating iact token $FILE
+        podman exec terraform-enterprise-terraform-enterprise tfectl admin token |  tr -cd '[:print:]' |  tee iact.token
+      fi
+
+      FILE=admin.token
+      if [ ! -e "$FILE" ] || [ ! -s "$FILE" ]; then
+        echo info: generating admin token $FILE
+        URL="https://${tfe_hostname}/admin/initial-admin-user?token=$(cat iact.token)"
+        curl -kL --globoff --header "Content-Type: application/json" --request POST --data @/tmp/payload.json "$${URL}"  | jq -r '.token' | tee admin.token
+      fi
+
+      popd
+
+  - path: "/usr/local/bin/tfe-bootstrap.sh"
+    permissions: "0755"
+    owner: "root:root"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      LOG_FILE="/var/log/tfe-bootstrap.log"
+      exec > >(tee -a "$LOG_FILE") 2>&1
+
+      echo "==== TFE bootstrap starting ===="
+
+      REGISTRY_TOKEN_FILE="/etc/terraform-enterprise/registry-token"
+
+      echo "Logging into images.releases.hashicorp.com..."
+      cat "$REGISTRY_TOKEN_FILE" | podman login --username terraform images.releases.hashicorp.com --password-stdin
+
+      echo "Pulling TFE image..."
+      podman pull "images.releases.hashicorp.com/hashicorp/terraform-enterprise:${tfe_image_tag}"
+
+      systemctl daemon-reload
+
+      # Unit exists but is 'generated' -> cannot enable, only start
+      if systemctl list-unit-files | awk '$1=="terraform-enterprise.service"{print $2}' | grep -q generated; then
+        echo "Unit is generated; starting without enable..."
+        systemctl start terraform-enterprise.service
+      else
+        echo "Unit is a real file; enabling..."
+        systemctl enable --now terraform-enterprise.service
+      fi
+
+      echo "==== TFE bootstrap completed ===="
+
+runcmd:
+  - mkdir -p /etc/terraform-enterprise/certs
+  - chmod 700 /etc/terraform-enterprise/certs
+  - mkdir -p ${data_dir}
+  - cp /etc/terraform-enterprise/config.yaml /etc/containers/systemd/tfe.yaml
+  - bash /usr/local/bin/tfe-bootstrap.sh
+  - bash /usr/local/bin/tfe-admin-user.sh
